@@ -1,0 +1,198 @@
+//@version=6
+indicator("Mean Reversion Suite: Adaptive Z + Half-Life + Probability Map", shorttitle="MR Suite", overlay=false, max_labels_count=500)
+
+// ============================================================================
+// Mean Reversion Suite
+//  1) Adaptive z-score   : volatility-adaptive EMA mean + EWMA variance -> stretch in sigmas
+//  2) Half-life clock    : rolling AR(1) fit of the stretch -> bars to revert half-way; regime filter
+//  3) Probability map    : on THIS chart's history, how often each stretch bucket reverted
+//                          within N bars, and how far it went against you first (in ATR)
+// Signals fire on the first TURN after an extreme stretch, only when the regime is
+// mean-reverting and the chart's own history supports the bucket.
+// ============================================================================
+
+// ------------------------------- Inputs -------------------------------------
+grpZ   = "Adaptive Z-Score"
+baseLen   = input.int(30, "Base mean length", minval=5, group=grpZ)
+atrFast   = input.int(10, "ATR fast (vol regime)", minval=2, group=grpZ)
+atrSlow   = input.int(50, "ATR slow (vol regime)", minval=5, group=grpZ)
+entryZ    = input.float(2.0, "Entry stretch (sigmas)", minval=0.5, step=0.1, group=grpZ)
+
+grpH   = "Half-Life Regime Filter"
+useRegime = input.bool(true, "Require mean-reverting regime for signals", group=grpH)
+hlLen     = input.int(100, "AR(1) fit window", minval=30, group=grpH)
+hlMin     = input.float(2.0, "Min half-life (bars)", minval=0.5, group=grpH)
+hlMax     = input.float(30.0, "Max half-life (bars)", minval=2, group=grpH)
+
+grpP   = "Probability Map"
+horizon   = input.int(10, "Revert horizon (bars)", minval=2, maxval=100, group=grpP)
+revertLvl = input.float(0.25, "Counts as reverted when |z| back within", minval=0.0, step=0.05, group=grpP)
+usePmap   = input.bool(true, "Require supportive history for signals", group=grpP)
+minSample = input.int(15, "Min samples in bucket", minval=1, group=grpP)
+minProb   = input.float(60.0, "Min revert probability %", minval=0, maxval=100, group=grpP)
+
+grpV   = "Display"
+showTension = input.bool(true, "Show tension line", group=grpV)
+showTable   = input.bool(true, "Show stats table", group=grpV)
+tblPos      = input.string("Top right", "Table position", options=["Top right", "Top left", "Bottom right", "Bottom left"], group=grpV)
+
+warmup = math.max(atrSlow, hlLen) + horizon + 5
+
+// ---------------------------- 1) Adaptive z-score ---------------------------
+atrF = ta.atr(atrFast)
+atrS = ta.atr(atrSlow)
+volRatio = atrS > 0 ? atrF / atrS : 1.0
+// calm (ratio < 1) -> shorter window, expanding vol -> longer window
+adaptLen = baseLen * math.max(0.5, math.min(2.0, volRatio))
+alpha = 2.0 / (adaptLen + 1.0)
+
+float mean = na
+mean := na(mean[1]) ? close : mean[1] + alpha * (close - mean[1])
+
+float dev = close - mean
+float vari = na
+vari := na(vari[1]) ? dev * dev : (1.0 - alpha) * vari[1] + alpha * dev * dev
+float sd = math.sqrt(math.max(vari, 1e-12))
+
+float z = bar_index >= warmup ? dev / sd : na
+
+// ---------------------------- 2) Half-life clock ----------------------------
+// stretch series y = ln(close/mean); regress dy on y[1]: dy = a + b*y[1]; half-life = -ln2 / ln(1+b)
+float y = math.log(close / mean)
+float dy = y - nz(y[1])
+float ylag = nz(y[1])
+float sdDy = ta.stdev(dy, hlLen)
+float sdY = ta.stdev(ylag, hlLen)
+float bSlope = sdY > 0 ? ta.correlation(dy, ylag, hlLen) * sdDy / sdY : na
+float halfLife = (not na(bSlope) and bSlope < 0 and bSlope > -1) ? -math.log(2) / math.log(1 + bSlope) : na
+bool regimeOn = not na(halfLife) and halfLife >= hlMin and halfLife <= hlMax
+
+// ------------------------------ 3) Probability map --------------------------
+// buckets by |z|: 1:[1,1.5) 2:[1.5,2) 3:[2,2.5) 4:[2.5,3) 5:[3,inf)
+f_bucket(float zz) =>
+    int b = 0
+    if not na(zz)
+        float a = math.abs(zz)
+        if a >= 3.0
+            b := 5
+        else if a >= 2.5
+            b := 4
+        else if a >= 2.0
+            b := 3
+        else if a >= 1.5
+            b := 2
+        else if a >= 1.0
+            b := 1
+    b
+
+var array<int> cnt = array.new<int>(6, 0)
+var array<int> hits = array.new<int>(6, 0)
+var array<float> advSum = array.new<float>(6, 0.0)
+
+// Evaluate the event that started `horizon` bars ago (it now has a full look-forward window).
+float zE = z[horizon]
+int bE = f_bucket(zE)
+int bEprev = f_bucket(z[horizon + 1])
+bool newEvent = bE > 0 and bE > bEprev and not na(z[horizon + 1])
+
+if newEvent
+    float sgn = math.sign(zE)
+    float entryPx = close[horizon]
+    float atrE = nz(atrF[horizon], atrF)
+    bool reverted = false
+    float worst = 0.0
+    for k = 1 to horizon
+        int off = horizon - k
+        float zz = z[off]
+        float adv = sgn < 0 ? entryPx - low[off] : high[off] - entryPx
+        worst := math.max(worst, adv)
+        if not na(zz) and sgn * zz <= revertLvl
+            reverted := true
+            break
+    array.set(cnt, bE, array.get(cnt, bE) + 1)
+    if reverted
+        array.set(hits, bE, array.get(hits, bE) + 1)
+    if atrE > 0
+        array.set(advSum, bE, array.get(advSum, bE) + worst / atrE)
+
+f_prob(int b) =>
+    int n = b > 0 ? array.get(cnt, b) : 0
+    n > 0 ? 100.0 * array.get(hits, b) / n : na
+
+// ------------------------------ Tension & signals ---------------------------
+int stretchBars = 0
+stretchBars := (not na(z) and math.abs(z) >= 1.0) ? nz(stretchBars[1]) + 1 : 0
+float tension = na(z) ? na : math.abs(z) * math.log(1 + stretchBars)
+
+int bPrev = f_bucket(z[1])
+float zPrev = z[1]
+int nPrev = bPrev > 0 ? array.get(cnt, bPrev) : 0
+float pPrev = f_prob(bPrev)
+bool histOk = not usePmap or (nPrev >= minSample and not na(pPrev) and pPrev >= minProb)
+bool regOk = not useRegime or regimeOn
+
+bool longSig = not na(z) and zPrev <= -entryZ and z > zPrev and regOk and histOk
+bool shortSig = not na(z) and zPrev >= entryZ and z < zPrev and regOk and histOk
+
+// --------------------------------- Plots ------------------------------------
+color zCol = na(z) ? color.gray : color.from_gradient(math.abs(z), 0, 3.0, color.new(color.gray, 70), z > 0 ? color.red : color.green)
+plot(z, "Z-Score", color=zCol, style=plot.style_columns)
+plot(showTension ? tension * math.sign(nz(z)) : na, "Tension", color=color.new(color.orange, 20), linewidth=2)
+
+hline(0, "Mean", color.gray, hline.style_dotted)
+hline(entryZ, "Upper entry", color.new(color.red, 40), hline.style_dashed)
+hline(-entryZ, "Lower entry", color.new(color.green, 40), hline.style_dashed)
+hline(3.0, "+3", color.new(color.red, 75), hline.style_dotted)
+hline(-3.0, "-3", color.new(color.green, 75), hline.style_dotted)
+
+bgcolor(useRegime and not regimeOn and not na(z) ? color.new(color.gray, 88) : na, title="Trending / stand-down")
+
+plotshape(longSig ? -entryZ : na, "Long", shape.triangleup, location.absolute, color.lime, size=size.small)
+plotshape(shortSig ? entryZ : na, "Short", shape.triangledown, location.absolute, color.red, size=size.small)
+
+// -------------------------------- Alerts ------------------------------------
+alertcondition(longSig, "MR Long", "Mean reversion LONG setup")
+alertcondition(shortSig, "MR Short", "Mean reversion SHORT setup")
+
+// --------------------------------- Table ------------------------------------
+tPos = switch tblPos
+    "Top left" => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left" => position.bottom_left
+    => position.top_right
+
+var table t = table.new(position.top_right, 4, 9, border_width=1, frame_color=color.gray, frame_width=1)
+
+if showTable and barstate.islast
+    table.set_position(t, tPos)
+    table.clear(t, 0, 0, 3, 8)
+    color hdr = color.new(color.gray, 60)
+    table.cell(t, 0, 0, "Z", bgcolor=hdr, text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 0, na(z) ? "-" : str.tostring(z, "#.##"), text_color=color.white, text_size=size.small)
+    table.cell(t, 2, 0, "Vol ratio", bgcolor=hdr, text_color=color.white, text_size=size.small)
+    table.cell(t, 3, 0, str.tostring(volRatio, "#.##"), text_color=color.white, text_size=size.small)
+
+    table.cell(t, 0, 1, "Half-life", bgcolor=hdr, text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 1, na(halfLife) ? "n/a" : str.tostring(halfLife, "#.#") + " bars", text_color=color.white, text_size=size.small)
+    table.cell(t, 2, 1, "Regime", bgcolor=hdr, text_color=color.white, text_size=size.small)
+    table.cell(t, 3, 1, regimeOn ? "REVERTING" : "TRENDING / NOISE", bgcolor=regimeOn ? color.new(color.green, 40) : color.new(color.red, 40), text_color=color.white, text_size=size.small)
+
+    table.cell(t, 0, 2, "|Z| bucket", bgcolor=hdr, text_color=color.white, text_size=size.small)
+    table.cell(t, 1, 2, "N", bgcolor=hdr, text_color=color.white, text_size=size.small)
+    table.cell(t, 2, 2, "Revert %", bgcolor=hdr, text_color=color.white, text_size=size.small)
+    table.cell(t, 3, 2, "Adverse (ATR)", bgcolor=hdr, text_color=color.white, text_size=size.small)
+
+    int curB = f_bucket(z)
+    array<string> names = array.from("", "1.0-1.5", "1.5-2.0", "2.0-2.5", "2.5-3.0", "3.0+")
+    for b = 1 to 5
+        int n = array.get(cnt, b)
+        float p = f_prob(b)
+        float adv = n > 0 ? array.get(advSum, b) / n : na
+        color bg = b == curB ? color.new(color.blue, 40) : na
+        table.cell(t, 0, 2 + b, array.get(names, b), bgcolor=bg, text_color=color.white, text_size=size.small)
+        table.cell(t, 1, 2 + b, str.tostring(n), bgcolor=bg, text_color=color.white, text_size=size.small)
+        table.cell(t, 2, 2 + b, na(p) ? "-" : str.tostring(p, "#.#") + "%", bgcolor=bg, text_color=color.white, text_size=size.small)
+        table.cell(t, 3, 2 + b, na(adv) ? "-" : str.tostring(adv, "#.##"), bgcolor=bg, text_color=color.white, text_size=size.small)
+
+    table.cell(t, 0, 8, "Horizon: " + str.tostring(horizon) + " bars | Reverted = |z| back within " + str.tostring(revertLvl, "#.##"), text_color=color.gray, text_size=size.tiny)
+    table.merge_cells(t, 0, 8, 3, 8)
