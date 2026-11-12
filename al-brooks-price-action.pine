@@ -1,5 +1,5 @@
 //@version=6
-indicator("Al Brooks Price Action Suite", shorttitle="Brooks PA", overlay=true, max_labels_count=200, max_lines_count=100)
+indicator("Al Brooks Price Action Suite", shorttitle="Brooks PA", overlay=true, max_labels_count=200, max_lines_count=500)
 
 // ============================================================================
 // Al Brooks Price Action Suite  (tuned for NQ / MNQ, 5-minute chart)
@@ -9,7 +9,8 @@ indicator("Al Brooks Price Action Suite", shorttitle="Brooks PA", overlay=true, 
 //   - the 20 EMA, colored by market-cycle state
 //   - a small triangle on graded with-trend H2 / L2 entries (no text by default)
 //   - rare, high-value structure: wedges, double tops/bottoms, measured move, 20-gap-bar
-//   - key levels (prior day H/L/C, day open, opening range)
+//   - key levels (prior day H/L/C, day open, opening range) as short per-day segments (no ladders)
+//   - micro trendlines (only the live one + the last few broken ones)
 // Everything else lives in the dashboard table.
 //
 // Modules:
@@ -21,6 +22,7 @@ indicator("Al Brooks Price Action Suite", shorttitle="Brooks PA", overlay=true, 
 //   6) EMA gap bars        (20 gap bar setup)
 //   7) Key levels          (prior day, day open, opening range)
 //   8) History stats       (how graded H2/L2 entries performed on THIS chart)
+//   9) Micro trendlines    (Brooks micro TLs: live line, broken lines, failed-break entries)
 // ============================================================================
 
 // ------------------------------- Inputs -------------------------------------
@@ -51,6 +53,15 @@ grpM   = "Measured Move / Gaps"
 showMM    = input.bool(true, "Show latest measured-move target", group=grpM)
 showGB    = input.bool(true, "Mark 20 gap bar setup", group=grpM)
 minGap    = input.int(20, "Gap bars required", minval=5, group=grpM)
+
+grpMT  = "Micro Trendlines"
+mtlMode   = input.string("Live + broken", "Draw mode", options=["Live + broken", "Broken only", "Off"], group=grpMT)
+mtlMax    = input.int(8, "Max bars in a micro TL", minval=4, maxval=15, group=grpMT)
+mtlMin    = input.int(4, "Min bars in a micro TL", minval=3, maxval=10, group=grpMT)
+mtlTouch  = input.int(3, "Min bars touching the line", minval=2, maxval=6, group=grpMT)
+mtlTol    = input.float(0.10, "Touch tolerance (ATR)", minval=0.0, step=0.02, group=grpMT)
+mtlKeep   = input.int(6, "Broken lines to keep on chart", minval=0, maxval=30, group=grpMT)
+mtlFail   = input.bool(true, "Mark failed breaks with the trend (dot)", group=grpMT)
 
 grpL   = "Key Levels"
 showPD    = input.bool(true, "Prior day high / low / close", group=grpL)
@@ -425,6 +436,21 @@ if not na(plv)
             mmLbl := label.new(bar_index + 25, tgt2, "MM", style=label.style_label_left, color=color.new(color.green, 40), textcolor=color.white, size=size.tiny)
 
 // --------------------------- 7) Key levels ----------------------------------
+f_level(line ln, bool show, float px, bool restart, color c) =>
+    line r = ln
+    if show and not na(px)
+        if restart or na(r)
+            if not na(r)
+                line.delete(r)
+            r := line.new(bar_index, px, bar_index, px, color=c, width=1, style=line.style_dotted)
+        else
+            line.set_xy1(r, line.get_x1(r), px)
+            line.set_xy2(r, bar_index, px)
+    else if not na(r) and na(px)
+        line.delete(r)
+        r := na
+    r
+
 float pdH = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
 float pdL = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
 float pdC = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
@@ -472,12 +498,129 @@ if sigStyle == "Label"
 plotshape(gbBull, "20 gap bar (bull) pullback", shape.diamond, location.belowbar, color.new(color.aqua, 20), size=size.tiny)
 plotshape(gbBear, "20 gap bar (bear) pullback", shape.diamond, location.abovebar, color.new(color.fuchsia, 20), size=size.tiny)
 
-plot(showPD ? pdH : na, "Prior day high", color=color.new(color.silver, 30), style=plot.style_linebr, linewidth=1)
-plot(showPD ? pdL : na, "Prior day low", color=color.new(color.silver, 30), style=plot.style_linebr, linewidth=1)
-plot(showPD ? pdC : na, "Prior day close", color=color.new(color.gray, 50), style=plot.style_linebr, linewidth=1)
-plot(showDO ? dayOpen : na, "Day open", color=color.new(color.yellow, 40), style=plot.style_linebr, linewidth=1)
-plot(showOR ? orH : na, "Opening range high", color=color.new(color.blue, 40), style=plot.style_linebr, linewidth=1)
-plot(showOR ? orL : na, "Opening range low", color=color.new(color.blue, 40), style=plot.style_linebr, linewidth=1)
+// Key levels are drawn as short segments for the CURRENT day only (no stepped "ladders").
+var line lnPdH = na
+var line lnPdL = na
+var line lnPdC = na
+var line lnDO = na
+var line lnOrH = na
+var line lnOrL = na
+bool orStart = inOR and not nz(inOR[1], false)
+
+lnPdH := f_level(lnPdH, showPD, pdH, newDay, color.new(color.silver, 25))
+lnPdL := f_level(lnPdL, showPD, pdL, newDay, color.new(color.silver, 25))
+lnPdC := f_level(lnPdC, showPD, pdC, newDay, color.new(color.gray, 40))
+lnDO := f_level(lnDO, showDO, dayOpen, newDay, color.new(color.yellow, 30))
+lnOrH := f_level(lnOrH, showOR, orH, orStart, color.new(color.blue, 25))
+lnOrL := f_level(lnOrL, showOR, orL, orStart, color.new(color.blue, 25))
+
+// ------------------------- 9) Micro trendlines ------------------------------
+// Brooks micro trendline: a tiny trend line across ~4-8 bars where (for a bull TL) every bar's
+// low sits on or above the line and several bars touch it. A break of it signals a pullback
+// is starting; a break that fails right away (bar closes back through the line) is a
+// with-trend entry. Bull TL uses lows, bear TL uses highs.
+f_tl(float src, int dirSign, int maxL, int minL, int minTouch, float touchTol, float belowTol) =>
+    int foundL = 0
+    float foundSlope = 0.0
+    for L = maxL to minL
+        if foundL == 0
+            float slope = (src[1] - src[L]) / (L - 1)
+            if dirSign * slope > 0
+                bool valid = true
+                int touches = 0
+                for j = L to 1
+                    float lineVal = src[L] + slope * (L - j)
+                    float dev = dirSign * (src[j] - lineVal)
+                    if dev < -belowTol
+                        valid := false
+                    if dev <= touchTol
+                        touches += 1
+                if valid and touches >= minTouch
+                    foundL := L
+                    foundSlope := slope
+    [foundL, foundSlope]
+
+[bL, bSlope] = f_tl(low, 1, mtlMax, mtlMin, mtlTouch, mtlTol * atrV, syminfo.mintick)
+[sL, sSlope] = f_tl(high, -1, mtlMax, mtlMin, mtlTouch, mtlTol * atrV, syminfo.mintick)
+
+float bullAt0 = bL > 0 ? low[bL] + bSlope * bL : na
+float bearAt0 = sL > 0 ? high[sL] + sSlope * sL : na
+bool bullBrk = bL > 0 and low < bullAt0 - syminfo.mintick
+bool bearBrk = sL > 0 and high > bearAt0 + syminfo.mintick
+
+var int bBrkX = na
+var float bBrkY = na
+var float bBrkSl = na
+var int bBrkBar = na
+var int sBrkX = na
+var float sBrkY = na
+var float sBrkSl = na
+var int sBrkBar = na
+
+if bullBrk
+    bBrkX := bar_index - bL
+    bBrkY := low[bL]
+    bBrkSl := bSlope
+    bBrkBar := bar_index
+if bearBrk
+    sBrkX := bar_index - sL
+    sBrkY := high[sL]
+    sBrkSl := sSlope
+    sBrkBar := bar_index
+
+float bLineNow = na(bBrkBar) ? na : bBrkY + bBrkSl * (bar_index - bBrkX)
+float sLineNow = na(sBrkBar) ? na : sBrkY + sBrkSl * (bar_index - sBrkX)
+// failed break within 2 bars: closes back through the line with a strong bar, in the trend direction
+bool mtlFailLong = not na(bBrkBar) and bar_index - bBrkBar <= 2 and close > bLineNow and isBull and (close - low) >= 0.6 * rng and state > 0
+bool mtlFailShort = not na(sBrkBar) and bar_index - sBrkBar <= 2 and close < sLineNow and isBear and (high - close) >= 0.6 * rng and state < 0
+if mtlFailLong or (not na(bBrkBar) and bar_index - bBrkBar >= 2)
+    bBrkBar := na
+if mtlFailShort or (not na(sBrkBar) and bar_index - sBrkBar >= 2)
+    sBrkBar := na
+
+var string lastMtl = "none"
+var int lastMtlBar = na
+if bullBrk
+    lastMtl := "Bull TL broken"
+    lastMtlBar := bar_index
+if bearBrk
+    lastMtl := "Bear TL broken"
+    lastMtlBar := bar_index
+if mtlFailLong
+    lastMtl := "Bull TL break FAILED (long)"
+    lastMtlBar := bar_index
+if mtlFailShort
+    lastMtl := "Bear TL break FAILED (short)"
+    lastMtlBar := bar_index
+
+// Drawing: one live line per side (redrawn each bar) + the last few broken lines (frozen)
+var line liveB = na
+var line liveS = na
+var array<line> frozen = array.new<line>()
+
+if not na(liveB)
+    line.delete(liveB)
+    liveB := na
+if not na(liveS)
+    line.delete(liveS)
+    liveS := na
+
+if mtlMode == "Live + broken"
+    if bL > 0 and not bullBrk
+        liveB := line.new(bar_index - bL, low[bL], bar_index + 2, low[bL] + bSlope * (bL + 2), color=color.new(color.green, 30), width=1, style=line.style_dotted)
+    if sL > 0 and not bearBrk
+        liveS := line.new(bar_index - sL, high[sL], bar_index + 2, high[sL] + sSlope * (sL + 2), color=color.new(color.red, 30), width=1, style=line.style_dotted)
+
+if mtlMode != "Off" and mtlKeep > 0
+    if bullBrk
+        array.push(frozen, line.new(bar_index - bL, low[bL], bar_index + 1, low[bL] + bSlope * (bL + 1), color=color.new(color.green, 10), width=1))
+    if bearBrk
+        array.push(frozen, line.new(bar_index - sL, high[sL], bar_index + 1, high[sL] + sSlope * (sL + 1), color=color.new(color.red, 10), width=1))
+    while array.size(frozen) > mtlKeep
+        line.delete(array.shift(frozen))
+
+plotshape(mtlFail and mtlFailLong, "Micro TL failed break (long)", shape.circle, location.belowbar, color.yellow, size=size.tiny)
+plotshape(mtlFail and mtlFailShort, "Micro TL failed break (short)", shape.circle, location.abovebar, color.yellow, size=size.tiny)
 
 // -------------------------------- Alerts ------------------------------------
 alertcondition(sigLong, "H2 long entry", "Brooks H2 with-trend long entry (graded)")
@@ -490,6 +633,10 @@ alertcondition(gbBull, "20 gap bar bull pullback", "First touch of EMA after 20+
 alertcondition(gbBear, "20 gap bar bear pullback", "First touch of EMA after 20+ bear gap bars")
 alertcondition(boUp, "Breakout up", "Bull breakout bar")
 alertcondition(boDn, "Breakout down", "Bear breakout bar")
+alertcondition(mtlFailLong, "Micro TL failed break long", "Bull micro trendline break failed - with-trend long")
+alertcondition(mtlFailShort, "Micro TL failed break short", "Bear micro trendline break failed - with-trend short")
+alertcondition(bullBrk, "Bull micro TL broken", "Bull micro trendline broken")
+alertcondition(bearBrk, "Bear micro TL broken", "Bear micro trendline broken")
 alertcondition(state != nz(state[1]), "Cycle state change", "Market cycle state changed")
 
 // --------------------------------- Dashboard --------------------------------
@@ -499,7 +646,7 @@ tPos = switch tblPos
     "Bottom left" => position.bottom_left
     => position.top_right
 
-var table t = table.new(position.top_right, 2, 9, border_width=1, frame_color=color.gray, frame_width=1)
+var table t = table.new(position.top_right, 2, 10, border_width=1, frame_color=color.gray, frame_width=1)
 
 f_stats(int n, int w1, int w2) =>
     n > 0 ? str.format("n={0}  1R {1}%  2R {2}%", n, math.round(100.0 * w1 / n), math.round(100.0 * w2 / n)) : "n=0 (no samples yet)"
@@ -532,3 +679,7 @@ if showTable and barstate.islast
     table.cell(t, 1, 7, sigTxt, text_color=txt, text_size=size.small)
     table.cell(t, 0, 8, "H2 / L2 history", bgcolor=hdr, text_color=txt, text_size=size.small)
     table.cell(t, 1, 8, "H2 " + f_stats(nL, w1L, w2L) + "\nL2 " + f_stats(nS, w1S, w2S), text_color=txt, text_size=size.small)
+    string mtlLive = bL > 0 ? "Bull micro TL live (" + str.tostring(bL) + " bars)" : sL > 0 ? "Bear micro TL live (" + str.tostring(sL) + " bars)" : "none live"
+    string mtlLast = na(lastMtlBar) ? "" : "\nLast: " + lastMtl + " (" + str.tostring(bar_index - lastMtlBar) + " bars ago)"
+    table.cell(t, 0, 9, "Micro TL", bgcolor=hdr, text_color=txt, text_size=size.small)
+    table.cell(t, 1, 9, mtlLive + mtlLast, text_color=txt, text_size=size.small)
