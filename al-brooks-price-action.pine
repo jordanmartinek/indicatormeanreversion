@@ -505,7 +505,7 @@ var line lnPdC = na
 var line lnDO = na
 var line lnOrH = na
 var line lnOrL = na
-bool orStart = inOR and not nz(inOR[1], false)
+bool orStart = inOR and not inOR[1]
 
 lnPdH := f_level(lnPdH, showPD, pdH, newDay, color.new(color.silver, 25))
 lnPdL := f_level(lnPdL, showPD, pdL, newDay, color.new(color.silver, 25))
