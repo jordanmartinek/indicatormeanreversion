@@ -1,0 +1,534 @@
+//@version=6
+indicator("Al Brooks Price Action Suite", shorttitle="Brooks PA", overlay=true, max_labels_count=200, max_lines_count=100)
+
+// ============================================================================
+// Al Brooks Price Action Suite  (tuned for NQ / MNQ, 5-minute chart)
+//
+// Design goal: a CLEAN chart. Brooks-style H1-H4 / L1-L4 counting happens
+// internally and feeds a grade; the chart only shows:
+//   - the 20 EMA, colored by market-cycle state
+//   - a small triangle on graded with-trend H2 / L2 entries (no text by default)
+//   - rare, high-value structure: wedges, double tops/bottoms, measured move, 20-gap-bar
+//   - key levels (prior day H/L/C, day open, opening range)
+// Everything else lives in the dashboard table.
+//
+// Modules:
+//   1) Bar classification  (trend / doji / inside / outside / climax)
+//   2) Market cycle state  (strong trend, channel, range) + breakout + always-in
+//   3) Pullback counting   (internal H1-H4 / L1-L4, graded H2/L2 signals)
+//   4) Reversals           (wedge top/bottom, double top/bottom)
+//   5) Measured move       (last leg projected from the pullback)
+//   6) EMA gap bars        (20 gap bar setup)
+//   7) Key levels          (prior day, day open, opening range)
+//   8) History stats       (how graded H2/L2 entries performed on THIS chart)
+// ============================================================================
+
+// ------------------------------- Inputs -------------------------------------
+grpC   = "Core"
+emaLen    = input.int(20, "EMA length", minval=2, group=grpC)
+atrLen    = input.int(14, "ATR length", minval=2, group=grpC)
+
+grpS   = "Market Cycle"
+slopeLen  = input.int(10, "EMA slope lookback (bars)", minval=2, group=grpS)
+weakSlope = input.float(0.025, "Channel slope (ATR per bar)", minval=0.0, step=0.005, group=grpS)
+strongSlope = input.float(0.060, "Strong trend slope (ATR per bar)", minval=0.0, step=0.005, group=grpS)
+sideLook  = input.int(20, "Bars-above-EMA lookback", minval=5, group=grpS)
+boLen     = input.int(20, "Breakout lookback (bars)", minval=5, group=grpS)
+climaxMult = input.float(2.5, "Climax bar = range x avg range", minval=1.2, step=0.1, group=grpS)
+
+grpP   = "Pullback Signals (H2 / L2)"
+sigStyle  = input.string("Triangle", "Marker style", options=["Triangle", "Label", "Off"], group=grpP)
+minScore  = input.int(3, "Min grade score (2=C, 3=B, 4+=A)", minval=2, maxval=5, group=grpP)
+touchATR  = input.float(0.35, "Pullback must reach EMA within (ATR)", minval=0.0, step=0.05, group=grpP)
+
+grpR   = "Reversal Structure"
+showRev   = input.bool(true, "Show wedge / double top-bottom labels", group=grpR)
+pivLen    = input.int(3, "Pivot strength (bars each side)", minval=1, maxval=10, group=grpR)
+maxWedge  = input.int(60, "Max wedge span (bars)", minval=10, group=grpR)
+dtTol     = input.float(0.30, "Double top/bottom tolerance (ATR)", minval=0.05, step=0.05, group=grpR)
+
+grpM   = "Measured Move / Gaps"
+showMM    = input.bool(true, "Show latest measured-move target", group=grpM)
+showGB    = input.bool(true, "Mark 20 gap bar setup", group=grpM)
+minGap    = input.int(20, "Gap bars required", minval=5, group=grpM)
+
+grpL   = "Key Levels"
+showPD    = input.bool(true, "Prior day high / low / close", group=grpL)
+showDO    = input.bool(true, "Day open", group=grpL)
+showOR    = input.bool(true, "Opening range", group=grpL)
+orSess    = input.session("0930-1000", "Opening range session", group=grpL)
+orTz      = input.string("America/New_York", "Opening range timezone", group=grpL)
+
+grpT   = "History Stats / Dashboard"
+maxHold   = input.int(30, "Max bars to hold a tracked trade", minval=5, group=grpT)
+showTable = input.bool(true, "Show dashboard", group=grpT)
+tblPos    = input.string("Top right", "Dashboard position", options=["Top right", "Top left", "Bottom right", "Bottom left"], group=grpT)
+
+// ------------------------------ Base series ---------------------------------
+float emaV = ta.ema(close, emaLen)
+float atrV = math.max(ta.atr(atrLen), syminfo.mintick)
+float avgRng = ta.sma(high - low, 20)
+
+// ------------------------- 1) Bar classification ----------------------------
+float rng = high - low
+float body = math.abs(close - open)
+float bodyPct = rng > 0 ? body / rng : 0.0
+bool isBull = close > open
+bool isBear = close < open
+bool isTrendBar = bodyPct >= 0.6
+bool isDoji = bodyPct <= 0.25
+bool isInside = high <= high[1] and low >= low[1]
+bool isOutside = high > high[1] and low < low[1]
+bool isClimax = rng >= climaxMult * nz(avgRng[1], avgRng)
+
+string barType = isClimax ? (isBull ? "Climax bull bar" : isBear ? "Climax bear bar" : "Climax doji")
+     : isTrendBar ? (isBull ? "Bull trend bar" : "Bear trend bar")
+     : isDoji ? "Doji"
+     : (isBull ? "Bull bar" : isBear ? "Bear bar" : "Doji")
+if isInside
+    barType += " (inside)"
+else if isOutside
+    barType += " (outside)"
+
+// --------------------------- 2) Market cycle state ---------------------------
+float slopeN = (emaV - nz(emaV[slopeLen], emaV)) / (slopeLen * atrV)
+float fracAbove = ta.sma(close > emaV ? 1.0 : 0.0, sideLook)
+
+bool bullCtx = slopeN > weakSlope and fracAbove >= 0.6
+bool bearCtx = slopeN < -weakSlope and fracAbove <= 0.4
+// 2 strong bull, 1 bull channel, 0 range, -1 bear channel, -2 strong bear
+int state = 0
+if bullCtx
+    state := (slopeN >= strongSlope and fracAbove >= 0.8) ? 2 : 1
+else if bearCtx
+    state := (slopeN <= -strongSlope and fracAbove <= 0.2) ? -2 : -1
+
+int side = state > 0 ? 1 : state < 0 ? -1 : 0
+bool sideFlip = side != nz(side[1])
+
+// Breakout detection
+float hhPrev = ta.highest(high, boLen)[1]
+float llPrev = ta.lowest(low, boLen)[1]
+bool boUp = not na(hhPrev) and close > hhPrev and isBull and bodyPct >= 0.6
+bool boDn = not na(llPrev) and close < llPrev and isBear and bodyPct >= 0.6
+var int lastBoBar = na
+var int lastBoDir = 0
+if boUp
+    lastBoBar := bar_index
+    lastBoDir := 1
+else if boDn
+    lastBoBar := bar_index
+    lastBoDir := -1
+bool recentBo = not na(lastBoBar) and bar_index - lastBoBar <= 3
+
+string stateTxt = switch state
+    2 => "Strong Bull Trend"
+    1 => "Bull Channel"
+    -1 => "Bear Channel"
+    -2 => "Strong Bear Trend"
+    => "Trading Range"
+
+string alwaysIn = state > 0 ? "LONG" : state < 0 ? "SHORT" : (not na(lastBoBar) and bar_index - lastBoBar <= 10 ? (lastBoDir > 0 ? "LONG (breakout)" : "SHORT (breakout)") : "NEUTRAL")
+
+color stateCol = switch state
+    2 => color.lime
+    1 => color.new(color.green, 20)
+    -1 => color.new(color.orange, 10)
+    -2 => color.red
+    => color.gray
+
+// -------------------------- 6) EMA gap bars ---------------------------------
+var int gapCnt = 0
+gapCnt := low > emaV ? (gapCnt > 0 ? gapCnt + 1 : 1) : high < emaV ? (gapCnt < 0 ? gapCnt - 1 : -1) : 0
+bool gbBull = showGB and nz(gapCnt[1]) >= minGap and gapCnt == 0
+bool gbBear = showGB and nz(gapCnt[1]) <= -minGap and gapCnt == 0
+
+// -------------------------- 3) Pullback counting ----------------------------
+float hi5 = ta.highest(high, 5)
+float lo5 = ta.lowest(low, 5)
+
+var float swingHigh = na
+var float swingLow = na
+var float pbLow = na
+var float pbHigh = na
+var int hCount = 0
+var int lCount = 0
+var bool pbH = false
+var bool pbL = false
+
+if na(swingHigh)
+    swingHigh := high
+    swingLow := low
+    pbLow := low
+    pbHigh := high
+
+if sideFlip
+    swingHigh := hi5
+    swingLow := lo5
+    pbLow := lo5
+    pbHigh := hi5
+    hCount := 0
+    lCount := 0
+    pbH := false
+    pbL := false
+
+// H count (pullbacks in an up move)
+if high > swingHigh
+    swingHigh := high
+    hCount := 0
+    pbH := false
+    pbLow := low
+else
+    pbLow := math.min(pbLow, low)
+    if high < high[1]
+        pbH := true
+    else if pbH and high > high[1]
+        hCount += 1
+        pbH := false
+
+// L count (pullbacks in a down move)
+if low < swingLow
+    swingLow := low
+    lCount := 0
+    pbL := false
+    pbHigh := high
+else
+    pbHigh := math.max(pbHigh, high)
+    if low > low[1]
+        pbL := true
+    else if pbL and low < low[1]
+        lCount += 1
+        pbL := false
+
+bool newH2 = hCount == 2 and nz(hCount[1]) != 2
+bool newL2 = lCount == 2 and nz(lCount[1]) != 2
+
+// Entry-bar and signal-bar quality
+bool entryBullOk = isBull and (close - low) >= 0.6 * rng and rng < climaxMult * nz(avgRng[1], avgRng)
+bool entryBearOk = isBear and (high - close) >= 0.6 * rng and rng < climaxMult * nz(avgRng[1], avgRng)
+bool entryBullStrong = entryBullOk and bodyPct >= 0.5 and (close - low) >= 0.75 * rng
+bool entryBearStrong = entryBearOk and bodyPct >= 0.5 and (high - close) >= 0.75 * rng
+float rngPrev = high[1] - low[1]
+bool sigBarBull = close[1] >= low[1] + 0.5 * rngPrev
+bool sigBarBear = close[1] <= high[1] - 0.5 * rngPrev
+
+int ctxPts = math.abs(state) == 2 ? 2 : math.abs(state) == 1 ? 1 : 0
+int scoreL = ctxPts + (pbLow <= emaV + touchATR * atrV ? 1 : 0) + (sigBarBull ? 1 : 0) + (entryBullStrong ? 1 : 0)
+int scoreS = ctxPts + (pbHigh >= emaV - touchATR * atrV ? 1 : 0) + (sigBarBear ? 1 : 0) + (entryBearStrong ? 1 : 0)
+
+bool sigLong = newH2 and state > 0 and entryBullOk and scoreL >= minScore
+bool sigShort = newL2 and state < 0 and entryBearOk and scoreS >= minScore
+int gradeL = scoreL
+int gradeS = scoreS
+
+f_grade(int s) =>
+    s >= 4 ? "A" : s == 3 ? "B" : "C"
+
+var string lastSig = "none"
+var int lastSigBar = na
+if sigLong
+    lastSig := "H2 " + f_grade(gradeL)
+    lastSigBar := bar_index
+if sigShort
+    lastSig := "L2 " + f_grade(gradeS)
+    lastSigBar := bar_index
+
+// --------------------------- 8) History stats -------------------------------
+var array<int> pDir = array.new<int>()
+var array<float> pStop = array.new<float>()
+var array<float> pT1 = array.new<float>()
+var array<float> pT2 = array.new<float>()
+var array<bool> pH1 = array.new<bool>()
+var array<int> pAge = array.new<int>()
+var int nL = 0
+var int w1L = 0
+var int w2L = 0
+var int nS = 0
+var int w1S = 0
+var int w2S = 0
+
+if array.size(pDir) > 0
+    for i = array.size(pDir) - 1 to 0 by -1
+        int d = array.get(pDir, i)
+        float st = array.get(pStop, i)
+        float t1 = array.get(pT1, i)
+        float t2 = array.get(pT2, i)
+        bool h1 = array.get(pH1, i)
+        int age = array.get(pAge, i) + 1
+        bool stopHit = d > 0 ? low <= st : high >= st
+        bool t1Hit = d > 0 ? high >= t1 : low <= t1
+        bool t2Hit = d > 0 ? high >= t2 : low <= t2
+        bool done = false
+        bool w1 = false
+        bool w2 = false
+        if not h1
+            if stopHit
+                done := true
+            else if t2Hit
+                done := true
+                w1 := true
+                w2 := true
+            else if t1Hit
+                h1 := true
+        else
+            if stopHit
+                done := true
+                w1 := true
+            else if t2Hit
+                done := true
+                w1 := true
+                w2 := true
+        if not done and age >= maxHold
+            done := true
+            w1 := h1
+        if done
+            if d > 0
+                nL += 1
+                w1L += w1 ? 1 : 0
+                w2L += w2 ? 1 : 0
+            else
+                nS += 1
+                w1S += w1 ? 1 : 0
+                w2S += w2 ? 1 : 0
+            array.remove(pDir, i)
+            array.remove(pStop, i)
+            array.remove(pT1, i)
+            array.remove(pT2, i)
+            array.remove(pH1, i)
+            array.remove(pAge, i)
+        else
+            array.set(pH1, i, h1)
+            array.set(pAge, i, age)
+
+if sigLong or sigShort
+    float entry = close
+    float risk = sigLong ? math.max(entry - math.min(low, low[1]), 0.5 * atrV) : math.max(math.max(high, high[1]) - entry, 0.5 * atrV)
+    int dirN = sigLong ? 1 : -1
+    array.push(pDir, dirN)
+    array.push(pStop, entry - dirN * risk)
+    array.push(pT1, entry + dirN * risk)
+    array.push(pT2, entry + dirN * 2.0 * risk)
+    array.push(pH1, false)
+    array.push(pAge, 0)
+
+// ----------------------- 4) Reversals + 5) Measured move --------------------
+float phv = ta.pivothigh(high, pivLen, pivLen)
+float plv = ta.pivotlow(low, pivLen, pivLen)
+
+var array<float> phP = array.new<float>()
+var array<int> phB = array.new<int>()
+var array<float> plP = array.new<float>()
+var array<int> plB = array.new<int>()
+
+var line mmLine = na
+var label mmLbl = na
+
+bool wedgeTop = false
+bool wedgeBot = false
+bool dTop = false
+bool dBot = false
+
+if not na(phv)
+    array.push(phP, phv)
+    array.push(phB, bar_index - pivLen)
+    if array.size(phP) > 3
+        array.shift(phP)
+        array.shift(phB)
+    if array.size(phP) == 3
+        float p1 = array.get(phP, 0)
+        float p2 = array.get(phP, 1)
+        float p3 = array.get(phP, 2)
+        int b1 = array.get(phB, 0)
+        int b2 = array.get(phB, 1)
+        int b3 = array.get(phB, 2)
+        float lb12 = high
+        float lb23 = high
+        for k = bar_index - b2 to bar_index - b1
+            lb12 := math.min(lb12, low[k])
+        for k = bar_index - b3 to bar_index - b2
+            lb23 := math.min(lb23, low[k])
+        bool wedge = p1 < p2 and p2 < p3 and lb23 > lb12 and (p3 - p2) < (p2 - p1) and (b3 - b1) <= maxWedge and (p3 - p1) >= atrV and state >= 0
+        bool dbl = not wedge and math.abs(p3 - p2) <= dtTol * atrV and (b3 - b2) >= 6 and (p2 - lb23) >= atrV
+        if wedge
+            wedgeTop := true
+            if showRev
+                line.new(b1, p1, b3, p3, color=color.new(color.red, 30), style=line.style_dotted, width=1)
+                label.new(b3, p3, "Wedge top", style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.small)
+        else if dbl
+            dTop := true
+            if showRev
+                label.new(b3, p3, "DT", style=label.style_label_down, color=color.new(color.maroon, 20), textcolor=color.white, size=size.small)
+    // Measured move for a bear leg: prior pivot low -> this pivot high is the pullback end
+    if showMM and state < 0 and array.size(phP) >= 2 and array.size(plP) >= 1
+        float pb = array.get(phP, array.size(phP) - 1)
+        int pbBar = array.get(phB, array.size(phB) - 1)
+        float lastPl = array.get(plP, array.size(plP) - 1)
+        int lastPlBar = array.get(plB, array.size(plB) - 1)
+        float prevPh = array.get(phP, array.size(phP) - 2)
+        int prevPhBar = array.get(phB, array.size(phB) - 2)
+        float leg = prevPh - lastPl
+        if prevPhBar < lastPlBar and lastPlBar < pbBar and leg >= 1.5 * atrV and pb < prevPh
+            float tgt = pb - leg
+            if not na(mmLine)
+                line.delete(mmLine)
+            if not na(mmLbl)
+                label.delete(mmLbl)
+            mmLine := line.new(pbBar, tgt, bar_index + 25, tgt, color=color.new(color.red, 20), style=line.style_dashed, width=1)
+            mmLbl := label.new(bar_index + 25, tgt, "MM", style=label.style_label_left, color=color.new(color.red, 40), textcolor=color.white, size=size.tiny)
+
+if not na(plv)
+    array.push(plP, plv)
+    array.push(plB, bar_index - pivLen)
+    if array.size(plP) > 3
+        array.shift(plP)
+        array.shift(plB)
+    if array.size(plP) == 3
+        float q1 = array.get(plP, 0)
+        float q2 = array.get(plP, 1)
+        float q3 = array.get(plP, 2)
+        int c1 = array.get(plB, 0)
+        int c2 = array.get(plB, 1)
+        int c3 = array.get(plB, 2)
+        float hb12 = low
+        float hb23 = low
+        for k = bar_index - c2 to bar_index - c1
+            hb12 := math.max(hb12, high[k])
+        for k = bar_index - c3 to bar_index - c2
+            hb23 := math.max(hb23, high[k])
+        bool wedgeB = q1 > q2 and q2 > q3 and hb23 < hb12 and (q2 - q3) < (q1 - q2) and (c3 - c1) <= maxWedge and (q1 - q3) >= atrV and state <= 0
+        bool dblB = not wedgeB and math.abs(q3 - q2) <= dtTol * atrV and (c3 - c2) >= 6 and (hb23 - q2) >= atrV
+        if wedgeB
+            wedgeBot := true
+            if showRev
+                line.new(c1, q1, c3, q3, color=color.new(color.green, 30), style=line.style_dotted, width=1)
+                label.new(c3, q3, "Wedge bottom", style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.small)
+        else if dblB
+            dBot := true
+            if showRev
+                label.new(c3, q3, "DB", style=label.style_label_up, color=color.new(color.teal, 20), textcolor=color.white, size=size.small)
+    // Measured move for a bull leg: prior pivot high -> this pivot low is the pullback end
+    if showMM and state > 0 and array.size(plP) >= 2 and array.size(phP) >= 1
+        float pb2 = array.get(plP, array.size(plP) - 1)
+        int pb2Bar = array.get(plB, array.size(plB) - 1)
+        float lastPh = array.get(phP, array.size(phP) - 1)
+        int lastPhBar = array.get(phB, array.size(phB) - 1)
+        float prevPl = array.get(plP, array.size(plP) - 2)
+        int prevPlBar = array.get(plB, array.size(plB) - 2)
+        float leg2 = lastPh - prevPl
+        if prevPlBar < lastPhBar and lastPhBar < pb2Bar and leg2 >= 1.5 * atrV and pb2 > prevPl
+            float tgt2 = pb2 + leg2
+            if not na(mmLine)
+                line.delete(mmLine)
+            if not na(mmLbl)
+                label.delete(mmLbl)
+            mmLine := line.new(pb2Bar, tgt2, bar_index + 25, tgt2, color=color.new(color.green, 20), style=line.style_dashed, width=1)
+            mmLbl := label.new(bar_index + 25, tgt2, "MM", style=label.style_label_left, color=color.new(color.green, 40), textcolor=color.white, size=size.tiny)
+
+// --------------------------- 7) Key levels ----------------------------------
+float pdH = request.security(syminfo.tickerid, "D", high[1], lookahead=barmerge.lookahead_on)
+float pdL = request.security(syminfo.tickerid, "D", low[1], lookahead=barmerge.lookahead_on)
+float pdC = request.security(syminfo.tickerid, "D", close[1], lookahead=barmerge.lookahead_on)
+
+bool newDay = timeframe.change("D")
+var float dayOpen = na
+var float dayHigh = na
+var float dayLow = na
+if newDay
+    dayOpen := open
+    dayHigh := high
+    dayLow := low
+else
+    dayHigh := math.max(nz(dayHigh, high), high)
+    dayLow := math.min(nz(dayLow, low), low)
+
+bool inOR = not na(time(timeframe.period, orSess, orTz))
+var float orH = na
+var float orL = na
+if newDay
+    orH := na
+    orL := na
+if inOR
+    if not inOR[1]
+        orH := high
+        orL := low
+    else
+        orH := math.max(orH, high)
+        orL := math.min(orL, low)
+
+float dayPos = (dayHigh - dayLow) > 0 ? 100.0 * (close - dayLow) / (dayHigh - dayLow) : 50.0
+
+// --------------------------------- Plots ------------------------------------
+plot(emaV, "20 EMA (cycle colored)", color=stateCol, linewidth=2)
+
+plotshape(sigLong and sigStyle == "Triangle", "H2 entry", shape.triangleup, location.belowbar, gradeL >= 4 ? color.lime : color.new(color.green, 30), size=size.tiny)
+plotshape(sigShort and sigStyle == "Triangle", "L2 entry", shape.triangledown, location.abovebar, gradeS >= 4 ? color.red : color.new(color.orange, 20), size=size.tiny)
+
+if sigStyle == "Label"
+    if sigLong
+        label.new(bar_index, low, "H2 " + f_grade(gradeL), style=label.style_label_up, color=color.new(color.green, 20), textcolor=color.white, size=size.tiny)
+    if sigShort
+        label.new(bar_index, high, "L2 " + f_grade(gradeS), style=label.style_label_down, color=color.new(color.red, 20), textcolor=color.white, size=size.tiny)
+
+plotshape(gbBull, "20 gap bar (bull) pullback", shape.diamond, location.belowbar, color.new(color.aqua, 20), size=size.tiny)
+plotshape(gbBear, "20 gap bar (bear) pullback", shape.diamond, location.abovebar, color.new(color.fuchsia, 20), size=size.tiny)
+
+plot(showPD ? pdH : na, "Prior day high", color=color.new(color.silver, 30), style=plot.style_linebr, linewidth=1)
+plot(showPD ? pdL : na, "Prior day low", color=color.new(color.silver, 30), style=plot.style_linebr, linewidth=1)
+plot(showPD ? pdC : na, "Prior day close", color=color.new(color.gray, 50), style=plot.style_linebr, linewidth=1)
+plot(showDO ? dayOpen : na, "Day open", color=color.new(color.yellow, 40), style=plot.style_linebr, linewidth=1)
+plot(showOR ? orH : na, "Opening range high", color=color.new(color.blue, 40), style=plot.style_linebr, linewidth=1)
+plot(showOR ? orL : na, "Opening range low", color=color.new(color.blue, 40), style=plot.style_linebr, linewidth=1)
+
+// -------------------------------- Alerts ------------------------------------
+alertcondition(sigLong, "H2 long entry", "Brooks H2 with-trend long entry (graded)")
+alertcondition(sigShort, "L2 short entry", "Brooks L2 with-trend short entry (graded)")
+alertcondition(wedgeTop, "Wedge top", "Wedge top confirmed")
+alertcondition(wedgeBot, "Wedge bottom", "Wedge bottom confirmed")
+alertcondition(dTop, "Double top", "Double top confirmed")
+alertcondition(dBot, "Double bottom", "Double bottom confirmed")
+alertcondition(gbBull, "20 gap bar bull pullback", "First touch of EMA after 20+ bull gap bars")
+alertcondition(gbBear, "20 gap bar bear pullback", "First touch of EMA after 20+ bear gap bars")
+alertcondition(boUp, "Breakout up", "Bull breakout bar")
+alertcondition(boDn, "Breakout down", "Bear breakout bar")
+alertcondition(state != nz(state[1]), "Cycle state change", "Market cycle state changed")
+
+// --------------------------------- Dashboard --------------------------------
+tPos = switch tblPos
+    "Top left" => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left" => position.bottom_left
+    => position.top_right
+
+var table t = table.new(position.top_right, 2, 9, border_width=1, frame_color=color.gray, frame_width=1)
+
+f_stats(int n, int w1, int w2) =>
+    n > 0 ? str.format("n={0}  1R {1}%  2R {2}%", n, math.round(100.0 * w1 / n), math.round(100.0 * w2 / n)) : "n=0 (no samples yet)"
+
+if showTable and barstate.islast
+    table.set_position(t, tPos)
+    color hdr = color.new(color.gray, 60)
+    color txt = color.white
+
+    string pullTxt = side > 0 ? "H" + str.tostring(hCount) + (hCount >= 3 ? "  (wedge risk)" : "") : side < 0 ? "L" + str.tostring(lCount) + (lCount >= 3 ? "  (wedge risk)" : "") : "n/a (range)"
+    string gapTxt = gapCnt > 0 ? "+" + str.tostring(gapCnt) + " bull gap bars" : gapCnt < 0 ? str.tostring(gapCnt) + " bear gap bars" : "0"
+    string sigTxt = na(lastSigBar) ? "none" : lastSig + " (" + str.tostring(bar_index - lastSigBar) + " bars ago)"
+    string boTxt = na(lastBoBar) ? "none" : (lastBoDir > 0 ? "Up" : "Down") + " (" + str.tostring(bar_index - lastBoBar) + " bars ago)"
+
+    table.cell(t, 0, 0, "Cycle", bgcolor=hdr, text_color=txt, text_size=size.small)
+    table.cell(t, 1, 0, stateTxt, bgcolor=color.new(stateCol, 55), text_color=txt, text_size=size.small)
+    table.cell(t, 0, 1, "Always in", bgcolor=hdr, text_color=txt, text_size=size.small)
+    table.cell(t, 1, 1, alwaysIn, text_color=txt, text_size=size.small)
+    table.cell(t, 0, 2, "Pullback count", bgcolor=hdr, text_color=txt, text_size=size.small)
+    table.cell(t, 1, 2, pullTxt, text_color=txt, text_size=size.small)
+    table.cell(t, 0, 3, "EMA gap bars", bgcolor=hdr, text_color=txt, text_size=size.small)
+    table.cell(t, 1, 3, gapTxt, text_color=txt, text_size=size.small)
+    table.cell(t, 0, 4, "Current bar", bgcolor=hdr, text_color=txt, text_size=size.small)
+    table.cell(t, 1, 4, barType, text_color=txt, text_size=size.small)
+    table.cell(t, 0, 5, "Last breakout", bgcolor=hdr, text_color=txt, text_size=size.small)
+    table.cell(t, 1, 5, boTxt, text_color=txt, text_size=size.small)
+    table.cell(t, 0, 6, "Day range pos", bgcolor=hdr, text_color=txt, text_size=size.small)
+    table.cell(t, 1, 6, str.tostring(dayPos, "#") + "% of today's range", text_color=txt, text_size=size.small)
+    table.cell(t, 0, 7, "Last signal", bgcolor=hdr, text_color=txt, text_size=size.small)
+    table.cell(t, 1, 7, sigTxt, text_color=txt, text_size=size.small)
+    table.cell(t, 0, 8, "H2 / L2 history", bgcolor=hdr, text_color=txt, text_size=size.small)
+    table.cell(t, 1, 8, "H2 " + f_stats(nL, w1L, w2L) + "\nL2 " + f_stats(nS, w1S, w2S), text_color=txt, text_size=size.small)
