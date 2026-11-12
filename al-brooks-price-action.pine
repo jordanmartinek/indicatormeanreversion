@@ -248,7 +248,7 @@ var int w1S = 0
 var int w2S = 0
 
 if array.size(pDir) > 0
-    for i = array.size(pDir) - 1 to 0 by -1
+    for i = array.size(pDir) - 1 to 0
         int d = array.get(pDir, i)
         float st = array.get(pStop, i)
         float t1 = array.get(pT1, i)
